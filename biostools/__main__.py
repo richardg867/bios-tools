@@ -109,6 +109,8 @@ def extract_process(queue, abort_flag, multifile_lock, dir_number_path, next_dir
 	file_extractors += [
 		extractors.ISOExtractor(),
 		extractors.FdimgExtractor(),
+		extractors.DellPFSExtractor(),
+		extractors.ArcmanagerExtractor(),
 		extractors.VMExtractor(),
 		extractors.PEExtractor(),
 		extractors.UnshieldExtractor(),
@@ -596,6 +598,7 @@ def analyze_process(queue, formatter, scan_base, options):
 		analyzers.SystemSoftAnalyzer(),
 		analyzers.TandonAnalyzer(),
 		analyzers.TinyBIOSAnalyzer(),
+		analyzers.VademAnalyzer(),
 		analyzers.WhizproAnalyzer(),
 		analyzers.ZenithAnalyzer(),
 	]

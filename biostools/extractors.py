@@ -15,7 +15,7 @@
 #
 #                Copyright 2021 RichardG.
 #
-import array, codecs, datetime, io, itertools, math, os, re, shutil, socket, struct, subprocess, sys, tempfile, time, zlib
+import array, codecs, datetime, io, itertools, math, os, re, shutil, socket, struct, subprocess, sys, tempfile, time, uuid, zlib
 try:
 	import PIL.Image
 except ImportError:
@@ -130,6 +130,267 @@ class ApricotExtractor(Extractor):
 		return dest_dir
 
 
+class ArcmanagerExtractor(Extractor):
+	"""Extract Fujitsu Arcmanager (SLC 32) archives and Win32 self-extractors.
+	   The older DOS Arcmanager format is handled by VMExtractor."""
+
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+
+		# Stored blocks are mapped through a GF(256) logarithm table.
+		self._log_table = [0] * 256
+		x = 1
+		for i in range(1, 256):
+			x <<= 1
+			if x > 0xff:
+				x ^= 0x12d
+			self._log_table[x] = i
+
+		# Characters not allowed in output file names.
+		self._invalid_name_pattern = re.compile('''[\\x00-\\x1F\\\\/:\\*\\?"<>\\|]''')
+
+	def _new_tree(self, internal_nodes):
+		"""Create an adaptive splay tree with the given number of internal
+		   nodes. Returns [up, left, right, leaf base]."""
+		node_count = (2 * internal_nodes) + 1
+		up = [(i - 1) >> 1 for i in range(node_count + 1)]
+		up[0] = 0
+		left = [(2 * i) + 1 for i in range(internal_nodes + 1)]
+		right = [(2 * i) + 2 for i in range(internal_nodes + 1)]
+		return [up, left, right, internal_nodes]
+
+	def _decode_symbol(self, tree, state):
+		"""Decode a symbol from a splay tree, then splay the tree."""
+		up, left, right, limit = tree
+		data, pos, end, bit_buf, bit_count = state
+
+		# Walk down the tree, reading bits MSB first.
+		node = 0
+		while node < limit:
+			if bit_count == 0:
+				if pos >= end:
+					raise Exception('out of input data')
+				bit_buf = data[pos]
+				pos += 1
+				bit_count = 8
+			bit_count -= 1
+			if (bit_buf >> bit_count) & 1:
+				node = right[node]
+			else:
+				node = left[node]
+		state[1] = pos
+		state[3] = bit_buf
+		state[4] = bit_count
+
+		# Semi-splay the tree around the decoded leaf.
+		a = node
+		while True:
+			c = up[a]
+			if c == 0:
+				break
+			d = up[c]
+			b = left[d]
+			if c == b:
+				b = right[d]
+				right[d] = a
+			else:
+				left[d] = a
+			if a == left[c]:
+				left[c] = b
+			else:
+				right[c] = b
+			up[a] = d
+			up[b] = c
+			a = d
+			if d == 0:
+				break
+
+		return node - limit
+
+	def _decompress_block(self, data, pos, size):
+		"""Decompress a block of splay tree coded data with LZP-style matches."""
+		state = [data, pos, pos + size, 0, 0]
+		contexts = [self._new_tree(256) for _ in range(128)] # order-1 contexts (7-bit)
+		length_tree = self._new_tree(31)
+		table = [0] * 8192
+		out = bytearray()
+
+		# Decode first two bytes, which aren't preceded by a match check.
+		out.append(self._decode_symbol(contexts[0], state) & 0xff)
+		out.append(self._decode_symbol(contexts[out[-1] & 0x7f], state) & 0xff)
+
+		while True:
+			# Decode literal, stopping at the end of block symbol.
+			symbol = self._decode_symbol(contexts[out[-1] & 0x7f], state)
+			if symbol == 0x100:
+				break
+			if len(out) >= 0x8000:
+				raise Exception('output overflow')
+			out.append(symbol)
+
+			# Look up the last 3 bytes on the match table.
+			b1, b2, b3 = out[-1], out[-2], out[-3]
+			table_index = (((((b2 & 0xf8) ^ b3) << 2) ^ (b2 & 7)) << 3) ^ b1
+			match_pos = table[table_index]
+			if match_pos == 1: # disabled
+				continue
+			out_pos = len(out)
+			if match_pos == 0 or out[match_pos - 1] != b1 or out[match_pos - 2] != b2:
+				table[table_index] = out_pos
+				continue
+
+			# Decode match length, with lengths of 31 followed by another length.
+			length = self._decode_symbol(length_tree, state)
+			if length == 0 and b2 != b1:
+				table[table_index] = 1
+			else:
+				table[table_index] = out_pos
+			while True:
+				if (len(out) + length) > 0x8000:
+					raise Exception('match overflow')
+				for x in range(length):
+					out.append(out[match_pos])
+					match_pos += 1
+				if length != 0x1f:
+					break
+				length = self._decode_symbol(length_tree, state)
+
+		return bytes(out)
+
+	def _read_blocks(self, data, pos, size):
+		"""Read and decompress blocks totaling the given compressed size."""
+		out = b''
+		end = pos + size
+		while pos < end:
+			block_header, = struct.unpack('>H', data[pos:pos + 2])
+			block_size = (block_header & 0x7fff) or 0x8000
+			pos += 2
+			if block_header & 0x8000:
+				out += bytes(self._log_table[x] for x in data[pos:pos + block_size])
+			else:
+				out += self._decompress_block(data, pos, block_size)
+			pos += block_size
+		return out
+
+	def extract(self, file_path, file_header, dest_dir, dest_dir_0):
+		# Stop if this is not an Arcmanager archive or self-extractor.
+		if b'Arcmanager(SLC 32)' not in file_header and file_header[4:6] != b'AM':
+			return False
+
+		# Read up to 16 MB as a safety net.
+		file_header += util.read_complement(file_path, file_header)
+
+		# Locate archive through the pointer at the end of the file.
+		if len(file_header) < 14:
+			return False
+		base, = struct.unpack('<I', file_header[-4:])
+		if (base + 10) > len(file_header) or file_header[base + 4:base + 6] != b'AM' or (file_header[base] & 0x70) != 0x50:
+			return False
+
+		try:
+			# Read directory offset.
+			pos = base + struct.unpack('<I', file_header[base + 6:base + 10])[0]
+
+			# Read file name table.
+			name_table_count, = struct.unpack('<H', file_header[pos:pos + 2])
+			pos += 2
+			names = b''
+			for x in range(name_table_count):
+				uncompressed_size, compressed_size = struct.unpack('<HH', file_header[pos:pos + 4])
+				pos += 4
+				names += self._read_blocks(file_header, pos, compressed_size)[:uncompressed_size]
+				pos += compressed_size
+
+			# Read directory table.
+			dir_count, = struct.unpack('<H', file_header[pos:pos + 2])
+			pos += 2
+			dirs = b''
+			if dir_count:
+				compressed_size, = struct.unpack('<H', file_header[pos:pos + 2])
+				pos += 2
+				dirs = self._read_blocks(file_header, pos, compressed_size)
+				pos += compressed_size
+
+			# Read file table.
+			file_count, compressed_size = struct.unpack('<II', file_header[pos:pos + 8])
+			pos += 8
+			files = self._read_blocks(file_header, pos, compressed_size)
+		except:
+			self.debug_print('Failed to read directory')
+			return False
+		self.debug_print('Archive at', hex(base), 'with', file_count, 'files and', dir_count, 'directories')
+
+		def _get_name(name_offset):
+			name_end = names.find(b'\x00', name_offset)
+			if name_end < 0:
+				name_end = len(names)
+			name = self._invalid_name_pattern.sub('_', names[name_offset:name_end].decode('cp437', 'ignore')).strip()
+			if name in ('', '.', '..'):
+				name = '_'
+			return name
+
+		def _get_dir(dir_index, depth=0):
+			# Directory entries are presumably level, name offset and parent index.
+			if dir_index == 0 or dir_index > dir_count or depth > 16:
+				return ''
+			entry = dirs[(dir_index - 1) * 10:dir_index * 10]
+			if len(entry) < 10:
+				return ''
+			name_offset, parent_index = struct.unpack('<II', entry[2:10])
+			return os.path.join(_get_dir(parent_index, depth + 1), _get_name(name_offset))
+
+		# Create destination directory and stop if it couldn't be created.
+		if not util.try_makedirs(dest_dir):
+			return True
+
+		# Extract files.
+		extracted_count = 0
+		for x in range(file_count):
+			entry = files[x * 40:(x + 1) * 40]
+			if len(entry) < 40:
+				break
+			dir_index, = struct.unpack('<H', entry[2:4])
+			uncompressed_size, compressed_size, data_offset, name_offset, flags = struct.unpack('<IIIII', entry[16:36])
+			file_name = os.path.join(_get_dir(dir_index), _get_name(name_offset))
+			self.debug_print('File', file_name, 'size', uncompressed_size, 'compressed', compressed_size, 'flags', hex(flags))
+
+			# Read data, which is either compressed or stored.
+			data_offset += base
+			try:
+				if flags & 0x100:
+					data = self._read_blocks(file_header, data_offset, compressed_size)[:uncompressed_size]
+				else:
+					data = file_header[data_offset:data_offset + uncompressed_size]
+			except:
+				self.debug_print('Failed to decompress', file_name)
+				continue
+
+			# Write file.
+			file_path_out = os.path.join(dest_dir, file_name)
+			if not util.try_makedirs(os.path.dirname(file_path_out)):
+				continue
+			try:
+				f = open(file_path_out, 'wb')
+				f.write(data)
+				f.close()
+				extracted_count += 1
+			except:
+				pass
+
+		# Stop if nothing was extracted.
+		if extracted_count == 0:
+			util.rmdirs(dest_dir)
+			return False
+
+		# Remove original file.
+		try:
+			os.remove(file_path)
+		except:
+			pass
+
+		# Return destination directory path.
+		return dest_dir
+
 class ArchiveExtractor(Extractor):
 	"""Extract known archive types."""
 
@@ -138,7 +399,7 @@ class ArchiveExtractor(Extractor):
 
 		# Known signatures for archive files.
 		self._signature_pattern = re.compile(
-			b'''PK(?:00PK)?\\x03\\x04|''' # zip
+			b'''PK(?:00PK|\\x07\\x08PK)?\\x03\\x04|''' # zip (optionally with spanning marker)
 			b'''Rar!\\x1A\\x07|''' # rar
 			b'''7z\\xBC\\xAF\\x27\\x1C|''' # 7z
 			b'''MSCF|''' # cab
@@ -148,6 +409,9 @@ class ArchiveExtractor(Extractor):
 			b'''[\\x00-\\xFF]{2}-l(?:h[467]|z4)-|''' # lha (methods supported by 7-Zip - HACK: except lh[05] due to Award)
 			b'''ZOO''' # zoo
 		)
+
+		# Zip local file header, for detecting zip archives preceded by other data.
+		self._zip_local_header_pattern = re.compile(b'''PK\\x03\\x04[\\x0A-\\x3F]\\x00''')
 
 		# Signatures for archive files extracted with deark instead of 7-Zip.
 		self._deark_signature_pattern = re.compile(
@@ -164,6 +428,11 @@ class ArchiveExtractor(Extractor):
 
 		# Filename sanitization pattern.
 		self._dos_fn_pattern = re.compile('''[\\x00-\\x1F\\x7F-\\xFF\\\\/:\\*\\?"<>\\|]''')
+
+		# Passwords used by vendor tools on encrypted archives.
+		self._known_passwords = (
+			'buildforge', # Gigabyte VGA BIOS updater
+		)
 
 		# 7-Zip has this annoying quirk where it scans the archive's parent
 		# directory structure before extracting the archive itself. This
@@ -230,10 +499,42 @@ class ArchiveExtractor(Extractor):
 		# Stop if this is apparently not an archive.
 		match = self._signature_pattern.match(file_header)
 		if not match:
-			return False
+			# Extract zip archives preceded by other data, keeping the original
+			# file around for analysis in case it's more than a self-extractor.
+			# (Mylex DAC960 firmware with imploded firmware image)
+			if not self._is_offset_zip(file_path, file_header):
+				return False
+			self.debug_print('Found zip archive preceded by other data:', file_path)
+			ret = self._extract_archive(file_path, dest_dir, remove=False)
+			if type(ret) == str and util.try_makedirs(dest_dir_0):
+				try:
+					shutil.move(file_path, os.path.join(dest_dir_0, os.path.basename(file_path)))
+				except:
+					pass
+			return ret
 
 		# Do the actual extraction.
 		return self._extract_archive(file_path, dest_dir)
+
+	def _is_offset_zip(self, file_path, file_header):
+		"""Check if this file contains a zip archive preceded by other data."""
+
+		# Look for a local file header past the beginning of the file.
+		match = self._zip_local_header_pattern.search(file_header, 1)
+		if not match:
+			return False
+		zip_offset = match.start(0)
+
+		# Look for the end of central directory record.
+		file_data = file_header + util.read_complement(file_path, file_header)
+		eocd_offset = file_data.rfind(b'PK\x05\x06')
+		if eocd_offset < zip_offset or (eocd_offset + 22) > len(file_data):
+			return False
+
+		# Check if the central directory offset is consistent with the local
+		# file header offset, which also rules out complete zip archives.
+		cd_size, cd_offset = struct.unpack('<II', file_data[eocd_offset + 12:eocd_offset + 20])
+		return zip_offset > 0 and (zip_offset + cd_offset + cd_size) == eocd_offset
 
 	def _extract_deark_archive(self, file_path, dest_dir):
 		# Stop if deark is not available.
@@ -301,7 +602,18 @@ class ArchiveExtractor(Extractor):
 		# Run 7z command to extract the archive.
 		# The dummy password prevents any password prompts from stalling 7z.
 		files_before = len(os.listdir(dest_dir))
-		subprocess.run(['7z', 'x', '-y', '-aou', '-ppassword', '--', link_path], stdout=self._devnull, stderr=subprocess.STDOUT, cwd=dest_dir)
+		proc = subprocess.run(['7z', 'x', '-y', '-aou', '-ppassword', '--', link_path], stdout=self._devnull, stderr=subprocess.STDOUT, cwd=dest_dir)
+
+		# Retry encrypted archives with known passwords, overwriting any files
+		# left behind by the failed attempt. (Gigabyte VGA BIOS updater)
+		if proc.returncode != 0:
+			listing = subprocess.run(['7z', 'l', '-slt', '-ppassword', '--', link_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=dest_dir).stdout
+			if b'\nEncrypted = +' in listing:
+				for password in self._known_passwords:
+					if subprocess.run(['7z', 't', '-p' + password, '--', link_path], stdout=self._devnull, stderr=subprocess.STDOUT, cwd=dest_dir).returncode == 0:
+						self.debug_print('Extracting encrypted archive with known password:', file_path)
+						subprocess.run(['7z', 'x', '-y', '-aoa', '-p' + password, '--', link_path], stdout=self._devnull, stderr=subprocess.STDOUT, cwd=dest_dir)
+						break
 
 		# 7-Zip refuses FAT images with orphaned long file name entries. Neutralize
 		# those and try again if nothing was extracted. (IBM Aptiva 2161 ARDI diskette)
@@ -582,6 +894,29 @@ class BIOSExtractor(Extractor):
 				self.debug_print('Extraction produced Intel option ROM without main body:', file_path)
 				util.remove_all(dest_dir_files, lambda x: os.path.join(dest_dir_0, x))
 				return False
+
+		# An image decompressed from AFUDOS which bios_extract couldn't handle
+		# (Aptio UEFI) must go through the other extractors on the next pass.
+		# The remaining files are just the flasher, so discard them.
+		if 'afudos.rom' in dest_dir_files:
+			self.debug_print('Passing AFUDOS image to next pass:', file_path)
+			if not util.try_makedirs(dest_dir):
+				return True
+			try:
+				shutil.move(os.path.join(dest_dir_0, 'afudos.rom'), os.path.join(dest_dir, 'afudos.rom'))
+			except:
+				return True
+			dest_dir_files.remove('afudos.rom')
+			util.remove_all(dest_dir_files, lambda x: os.path.join(dest_dir_0, x))
+			try:
+				os.rmdir(dest_dir_0)
+			except:
+				pass
+			try:
+				os.remove(file_path)
+			except:
+				pass
+			return dest_dir
 
 		# A missing remainder.rom may indicate an extraction interrupted by a segfault
 		# or something else gone wrong. Copy the original file to its place for safety.
@@ -934,6 +1269,212 @@ class DellExtractor(Extractor):
 
 		# Return destination directory path.
 		return dest_dir_0
+
+class DellPFSExtractor(Extractor):
+	"""Extract Dell PFS (Platform Firmware Specification?) update packages.
+	   Format information from platomav's BIOSUtilities (Dell PFS Update Extractor)."""
+
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+
+		# zlib-compressed PFS section marker, followed by a zlib header.
+		self._zlib_section_pattern = re.compile(b'''\\xAA\\xEE\\xAA\\x76\\x1B\\xEC\\xBB\\x20\\xF1\\xE6\\x51[\\x00-\\xFF](?=\\x78[\\x01\\x5E\\x9C\\xDA])''')
+
+		# Uncompressed PFS header.
+		self._pfs_header_pattern = re.compile(b'''PFS\\.HDR\\.[\\x01\\x02]\\x00\\x00\\x00''')
+
+		# Characters not allowed in output file names.
+		self._invalid_name_pattern = re.compile('''[^\\w\\-\\.\\(\\) ]+''')
+
+	def _parse_pfs(self, data, offset):
+		"""Parse a PFS container at the given offset. Returns a list of
+		   (guid, version, data) tuples, or None if the container is invalid."""
+
+		# Validate header and footer.
+		if data[offset:offset + 8] != b'PFS.HDR.':
+			return None
+		header_version, payload_size = struct.unpack('<II', data[offset + 8:offset + 16])
+		if header_version not in (1, 2):
+			return None
+		payload_start = offset + 16
+		payload_end = payload_start + payload_size
+		if data[payload_end + 8:payload_end + 16] != b'PFS.FTR.':
+			return None
+
+		# Parse entries.
+		entries = []
+		entry_offset = payload_start
+		while (entry_offset + 0x38) <= payload_end:
+			guid = data[entry_offset:entry_offset + 16]
+			entry_version, = struct.unpack('<I', data[entry_offset + 0x10:entry_offset + 0x14])
+			version_types = data[entry_offset + 0x14:entry_offset + 0x18]
+			version_fields = struct.unpack('<4H', data[entry_offset + 0x18:entry_offset + 0x20])
+			data_size, data_sig_size, data_met_size, data_met_sig_size = struct.unpack('<4I', data[entry_offset + 0x28:entry_offset + 0x38])
+			if entry_version == 1:
+				entry_header_size = 0x48
+			elif entry_version == 2:
+				entry_header_size = 0x58
+			else:
+				self.debug_print('Unknown PFS entry version', entry_version, 'at', hex(entry_offset))
+				break
+
+			# Format version.
+			if version_types == b'AN  ' and 10 <= version_fields[0] <= 35:
+				# Dell BIOS version: letter and two-digit number (A05)
+				version = '{0}{1:02}'.format(chr(0x37 + version_fields[0]), version_fields[1])
+			else:
+				version = ''
+				for x in range(len(version_fields)):
+					if version_types[x] == 0x41: # hex
+						version += '{0:X}.'.format(version_fields[x])
+					elif version_types[x] == 0x4E: # decimal
+						version += '{0}.'.format(version_fields[x])
+					else:
+						break
+				version = version[:-1]
+
+			# Add entry.
+			entry_data_start = entry_offset + entry_header_size
+			entries.append((guid, version, data[entry_data_start:entry_data_start + data_size]))
+
+			entry_offset = entry_data_start + data_size + data_sig_size + data_met_size + data_met_sig_size
+
+		return entries
+
+	def _parse_info(self, entries):
+		"""Get entry names from the PFS information entry, if present."""
+		names = {}
+		guids = [entry[0] for entry in entries]
+		for guid, version, entry_data in entries:
+			# Check if this is an information entry: a list of version 1
+			# records, the first of which describes the first entry.
+			if entry_data[:20] != (b'\x01\x00\x00\x00' + guids[0]):
+				continue
+
+			# Parse records.
+			offset = 0
+			while (offset + 34) <= len(entry_data):
+				record_version, = struct.unpack('<I', entry_data[offset:offset + 4])
+				if record_version != 1:
+					break
+				record_guid = entry_data[offset + 4:offset + 20]
+				char_count, = struct.unpack('<H', entry_data[offset + 32:offset + 34])
+				name_end = offset + 34 + (char_count * 2)
+				if name_end > len(entry_data):
+					break
+				try:
+					names[record_guid] = entry_data[offset + 34:name_end].decode('utf-16le', 'ignore')
+				except:
+					pass
+				offset = name_end + 2
+
+			# Name the information entry itself.
+			names[guid] = 'PFS Information'
+			break
+		return names
+
+	def _extract_data(self, data, dest_dir, depth=0):
+		"""Extract PFS containers and zlib sections from data.
+		   Returns the number of files written."""
+
+		# Stop if we're too deep.
+		if depth > 4:
+			return 0
+
+		# Decompress all zlib sections, then look for PFS containers
+		# within both the decompressed and the original data.
+		blobs = []
+		for match in self._zlib_section_pattern.finditer(data):
+			try:
+				decompressed = zlib.decompressobj().decompress(data[match.end():])
+			except:
+				self.debug_print('zlib decompression failed at', hex(match.end()))
+				continue
+			self.debug_print('Decompressed zlib section at', hex(match.end()), 'to', len(decompressed), 'bytes')
+			blobs.append(decompressed)
+		blobs.append(data)
+
+		file_count = 0
+		pfs_count = 0
+		for blob in blobs:
+			for match in self._pfs_header_pattern.finditer(blob):
+				# Parse PFS container.
+				entries = self._parse_pfs(blob, match.start())
+				if not entries:
+					continue
+				self.debug_print('Found PFS container with', len(entries), 'entries at', hex(match.start()))
+
+				# Extract entries.
+				pfs_dir = dest_dir
+				if pfs_count > 0:
+					pfs_dir = os.path.join(dest_dir, 'pfs_{0}'.format(pfs_count))
+				pfs_count += 1
+				names = self._parse_info(entries)
+				for x in range(len(entries)):
+					guid, version, entry_data = entries[x]
+					if len(entry_data) == 0:
+						continue
+
+					# Generate file name.
+					name = names.get(guid, None)
+					if not name:
+						name = str(uuid.UUID(bytes_le=guid)).upper()
+					file_name = '{0:02}_{1}'.format(x, name)
+					if version:
+						file_name += '_' + version
+					file_name = self._invalid_name_pattern.sub('_', file_name).strip()
+
+					# Extract nested containers into a subdirectory, or write the entry as-is.
+					entry_dir = os.path.join(pfs_dir, file_name)
+					if util.try_makedirs(entry_dir):
+						nested_count = self._extract_data(entry_data, entry_dir, depth + 1)
+						if nested_count > 0:
+							file_count += nested_count
+							continue
+						try:
+							os.rmdir(entry_dir)
+						except:
+							pass
+
+					if util.try_makedirs(pfs_dir):
+						try:
+							f = open(os.path.join(pfs_dir, file_name + '.bin'), 'wb')
+							f.write(entry_data)
+							f.close()
+							file_count += 1
+						except:
+							pass
+
+		return file_count
+
+	def extract(self, file_path, file_header, dest_dir, dest_dir_0):
+		# The PFS data may be anywhere in a large executable, so read up
+		# to 64 MB of executables or files which appear to contain PFS data.
+		if file_header[:2] != b'MZ' and not self._zlib_section_pattern.search(file_header) and not self._pfs_header_pattern.search(file_header):
+			return False
+		file_header += util.read_complement(file_path, file_header, 67108864)
+
+		# Stop if this is not a PFS package.
+		if not self._zlib_section_pattern.search(file_header) and not self._pfs_header_pattern.search(file_header):
+			return False
+
+		# Create destination directory and stop if it couldn't be created.
+		if not util.try_makedirs(dest_dir):
+			return True
+
+		# Extract PFS data, and stop if nothing was extracted. (false positive)
+		if self._extract_data(file_header, dest_dir) == 0:
+			util.rmdirs(dest_dir)
+			return False
+
+		# Remove original file.
+		try:
+			os.remove(file_path)
+		except:
+			pass
+
+		# Return destination directory path.
+		return dest_dir
 
 class DiscardExtractor(Extractor):
 	"""Detect and discard known non-useful file types."""

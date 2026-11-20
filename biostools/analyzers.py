@@ -670,12 +670,13 @@ class AMIIntelAnalyzer(Analyzer):
 
 
 class AMIUEFIAnalyzer(AMIAnalyzer):
+	# "AMITSESetup" (Pegatron H63ST), UTF-16 "AMITSE" module name (Dell OptiPlex 990)
+	# Reused by PhoenixAnalyzer.
+	_identifier_pattern = re.compile(b'''\\$SGN\\$|ALASKAA M I|[Xx]-UEFI-AMI|AMITSESetup|A\\x00M\\x00I\\x00T\\x00S\\x00E\\x00\\x00\\x00''')
+
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
 		self.vendor_id = 'AMIUEFI'
-
-		# "AMITSESetup" (Pegatron H63ST)
-		self._identifier_pattern = re.compile(b'''\\$SGN\\$|ALASKAA M I|[Xx]-UEFI-AMI|AMITSESetup''')
 		self._signon_asus_pattern = re.compile(b''' ACPI BIOS Rev''')
 		self._signon_intel_msi_pattern = re.compile(b'''\\$((?:IBIOSI|MSESGN)\\$|UBI)([\\x20-\\x7E]{4,})''')
 		self._signon_sgn_pattern = re.compile(b'''\\$SGN\\$[\\x01-\\xFF][\\x00-\\xFF]{2}''')
@@ -739,19 +740,35 @@ class AmproAnalyzer(Analyzer):
 		super().__init__('AMPRO', *args, **kwargs)
 
 		self._version_pattern = re.compile(b'''AMPRO (.+) Rom-Bios[^\\n]+\\nVersion ([^ ]+)''')
+		# CoreModule on top of Award XT BIOS (CM/PC)
+		self._coremodule_pattern = re.compile(b'''([A-Za-z0-9/\\-]+) (R[0-9]+\\.[0-9]+[\\x21-\\x7E]*) Copyright \\(c\\) [0-9\\-]+, Ampro Computers, Inc\\.\\r?\\n([0-9]{2}/[0-9]{2}/[0-9]{4} - [0-9]{2}:[0-9]{2}:[0-9]{2})?''')
 
 	def can_handle(self, file_path, file_data, header_data):
 		match = self._version_pattern.search(file_data)
-		if not match:
-			return False
+		if match:
+			# Extract version.
+			self.version = match.group(2).decode('cp437', 'ignore')
 
-		# Extract version.
-		self.version = match.group(2).decode('cp437', 'ignore')
+			# Extract board type as a sign-on.
+			self.signon = match.group(1).decode('cp437', 'ignore')
 
-		# Extract board type as a sign-on.
-		self.signon = match.group(1).decode('cp437', 'ignore')
+			return True
 
-		return True
+		match = self._coremodule_pattern.search(file_data)
+		if match:
+			# Extract version.
+			self.version = match.group(2).decode('cp437', 'ignore')
+
+			# Extract board type as a sign-on.
+			self.signon = match.group(1).decode('cp437', 'ignore')
+
+			# Extract build date as metadata.
+			if match.group(3):
+				self.metadata.append(('Build', match.group(3).decode('cp437', 'ignore')))
+
+			return True
+
+		return False
 
 
 class AmstradAnalyzer(NoInfoAnalyzer):
@@ -1980,12 +1997,33 @@ class MylexAnalyzer(Analyzer):
 		super().__init__('Mylex', *args, **kwargs)
 
 		self._version_pattern = re.compile(b'''MYLEX [\\x20-\\x7E]+ BIOS Version ([\\x20-\\x7E]+) ([0-9]{2}/[0-9]{2}/[0-9]{2})''')
+		# Version and date stored separately from the model string (DAC960P firmware image)
+		self._dac960_model_pattern = re.compile(b'''\\r\\n(DAC960[\\x21-\\x7E]*) BIOS Version \\$Mylex Corporation''')
+		self._dac960_version_pattern = re.compile(b''' Build \\$([0-9]+\\.[0-9]+[A-Za-z]?) - ([0-9]{1,2} [A-Za-z]{3} [0-9]{2,4})''')
 
 	def can_handle(self, file_path, file_data, header_data):
 		# Determine location of the identification block.
 		match = self._version_pattern.search(file_data)
 		if not match:
-			return False
+			# Handle DAC960 BIOS with separate version string.
+			match = self._dac960_model_pattern.search(file_data)
+			if not match:
+				return False
+			model = match.group(1).decode('cp437', 'ignore')
+			match = self._dac960_version_pattern.search(file_data)
+			if not match:
+				return False
+
+			# Extract version.
+			self.version = match.group(1).decode('cp437', 'ignore')
+
+			# Extract date as a string.
+			self.string = match.group(2).decode('cp437', 'ignore')
+
+			# Reconstruct full version string as metadata.
+			self.metadata.append(('ID', '{0} BIOS Version {1} - {2}'.format(model, self.version, self.string)))
+
+			return True
 
 		# Extract version.
 		self.version = match.group(1).decode('cp437', 'ignore')
@@ -2766,6 +2804,10 @@ class PhoenixAnalyzer(Analyzer):
 		# - Windows 95 INF updates
 		# - Intel UEFI with PCI device list (UTF-8 encoded)
 		if self._ignore_pattern.search(file_data):
+			return False
+
+		# Skip AMI UEFI with a legacy Phoenix copyright in the CSM. (Dell OptiPlex 990)
+		if header_data == b'\x00\xFFUEFIExtract\xFF\x00' and AMIUEFIAnalyzer._identifier_pattern.search(file_data):
 			return False
 
 		# Extract Intel data in a preliminary manner in case extraction failed.
@@ -3788,6 +3830,34 @@ class ToshibaAnalyzer(Analyzer):
 			self.string = (match.group(1) or match.group(2))[-16:].decode('cp437', 'ignore')
 
 		return True
+
+
+class VademAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Vadem', *args, **kwargs)
+
+		# Vadem stores most strings with inverted case.
+		self._version_pattern = re.compile(b'''\\xEB[\\x00-\\xFF]([\\x21-\\x7E]{1,16})\\r\\nfIRMWARE vERSION ([\\x21-\\x7E]+) *\\x00Vadem\\r''')
+		self._oem_pattern = re.compile(b'''[\\x21-\\x7E]+\\x00\\r\\n((?:vERSION [\\x21-\\x7E]+\\r\\n)?cOPYRIGHT ?\\([Cc]\\)[\\x20-\\x7E]+)\\r\\n\\x00''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		match = self._version_pattern.search(file_data)
+		if not match:
+			return False
+
+		# Extract version.
+		self.version = match.group(2).decode('cp437', 'ignore')
+
+		# Extract build identifier (preceded by a short jump) as a string.
+		self.string = match.group(1).decode('cp437', 'ignore')
+
+		# Extract OEM version and copyright as a sign-on, restoring case.
+		match = self._oem_pattern.search(file_data)
+		if match:
+			self.signon = match.group(1).decode('cp437', 'ignore').swapcase().replace('\r', '')
+
+		return True
+
 
 class WhizproAnalyzer(Analyzer):
 	def __init__(self, *args, **kwargs):
