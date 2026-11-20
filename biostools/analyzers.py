@@ -289,18 +289,29 @@ class AcerMultitechAnalyzer(Analyzer):
 		self.vendor = 'Acer'
 
 		self._version_pattern = re.compile(b'''Multitech Industrial Corp\\..BIOS ([^\\s]+ [^\\s\\x00]+)''')
+		# Without the above string (PC-700, Thomson TO16)
+		self._selftest_version_pattern = re.compile(b'''\\* SELF-TEST \\*\\x0D\\x0A\\x00 \\x00P-CK Error !\\x00(?:([\\x20-\\x7E]+)\\x0D\\x0A)?BIOS Version ([\\x21-\\x7E]+) *\\x0D\\x0A''')
 
 	def can_handle(self, file_path, file_data, header_data):
 		# Look for version and date.
 		match = self._version_pattern.search(file_data)
-		if not match:
-			return False
+		if match:
+			# Extract date and version as a string.
+			self.string = match.group(1).decode('cp437', 'ignore')
+		else:
+			match = self._selftest_version_pattern.search(file_data)
+			if not match or (b'Multitech' not in file_data and b'MULTITECH' not in file_data):
+				return False
+
+			# Extract version as a string.
+			self.string = match.group(2).decode('cp437', 'ignore')
+
+			# Extract OEM model as a sign-on. (Thomson)
+			if match.group(1):
+				self.signon = match.group(1).decode('cp437', 'ignore')
 
 		# Set static version.
 		self.version = 'Multitech'
-
-		# Extract date and version as a string.
-		self.string = match.group(1).decode('cp437', 'ignore')
 
 		return True
 
@@ -780,6 +791,23 @@ class AmstradAnalyzer(NoInfoAnalyzer):
 
 	def has_strings(self, file_data):
 		return self._plc_pattern.search(file_data) and self._bios_pattern.search(file_data)
+
+
+class AnnabooksAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Annabooks', *args, **kwargs)
+
+		self._version_pattern = re.compile(b'''Version ([\\x21-\\x7E]+) \\x00Annabooks AT BiosKit \\x00''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		match = self._version_pattern.search(file_data)
+		if not match:
+			return False
+
+		# Extract version.
+		self.version = match.group(1).decode('cp437', 'ignore')
+
+		return True
 
 
 class AwardAnalyzer(Analyzer):
@@ -1544,6 +1572,26 @@ class ChipsAnalyzer(Analyzer):
 		return True
 
 
+class ColumbiaAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Columbia', *args, **kwargs)
+
+		self._version_pattern = re.compile(b'''\\x0DROM/BIOS Ver ([\\x21-\\x7E]+) \\x0D''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		if b'ROM/BIOS Copyright Columbia Data Products' not in file_data:
+			return False
+
+		# Extract version.
+		match = self._version_pattern.search(file_data)
+		if match:
+			self.version = match.group(1).decode('cp437', 'ignore')
+		else:
+			self.version = '?'
+
+		return True
+
+
 class CommodoreAnalyzer(Analyzer):
 	# Prefix decoded from CP437: "┌─+┐"
 	# Reused by PhoenixAnalyzer.
@@ -1584,8 +1632,8 @@ class CompaqAnalyzer(NoInfoAnalyzer):
 	def __init__(self, *args, **kwargs):
 		super().__init__('Compaq', *args, **kwargs)
 
-		self._copyright_pattern = re.compile(b'''Copyright ([0-9]+ by )?COMPAQ Computer Corporation''')
-		self._error_pattern = re.compile(b'''Insert (?:DIAGNOSTIC diskette in Drive |COMPAQ DOS diskette)|You must load COMPAQ BASIC|[0-9]{2}/[0-9]{2}/[0-9]{2} +[^ ]+ +Copyright [0-9]+ by COMPAQ Computer Corporation''')
+		self._copyright_pattern = re.compile(b'''Copyright ([0-9]+ by )?COMPAQ Computer Corporation|\\(C\\)Copyright COMPAQ Computer Corp\\. ''') # (Deskpro revision J)
+		self._error_pattern = re.compile(b'''Insert (?:DIAGNOSTIC diskette in Drive |COMPAQ (?:MS-)?DOS diskette)|You must load COMPAQ BASIC|[0-9]{2}/[0-9]{2}/[0-9]{2} +[^ ]+ +Copyright [0-9]+ by COMPAQ Computer Corporation''')
 		self._entrypoint_pattern = re.compile(b'''[0-9]{2}COMPAQ\\xEA[\\x00-\\xFF]{2}\\x00\\xF0(?:0[1-9]|1[0-2])/(?:0[1-9]|[12][0-9]|3[01])/[0-9]{2} ''')
 
 	def has_strings(self, file_data):
@@ -1689,12 +1737,52 @@ class DTKAnalyzer(Analyzer):
 
 		return False
 
+class EpsonAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Epson', *args, **kwargs)
+
+		self._version_pattern = re.compile(b'''ROM Rev ([\\x21-\\x7E]+) ([0-9]{2}/[0-9]{2}/[0-9]{2}) Copyright \\(C\\) SEIKO EPSON Corp\\.''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		match = self._version_pattern.search(file_data)
+		if not match:
+			return False
+
+		# Extract version.
+		self.version = match.group(1).decode('cp437', 'ignore')
+
+		# Extract date as a string.
+		self.string = match.group(2).decode('cp437', 'ignore')
+
+		return True
+
+
+class ERSOAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('ERSO', *args, **kwargs)
+
+		self._version_pattern = re.compile(b'''ERSO ([\\x20-\\x7E]+?) BIOS ?VERSION ([\\x21-\\x7E]+) \\(C\\) ?COPYRIGHT''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		match = self._version_pattern.search(file_data)
+		if not match:
+			return False
+
+		# Extract version.
+		self.version = match.group(2).decode('cp437', 'ignore')
+
+		# Extract model as a sign-on.
+		self.signon = match.group(1).decode('cp437', 'ignore')
+
+		return True
+
+
 class GeneralSoftwareAnalyzer(Analyzer):
 	def __init__(self, *args, **kwargs):
 		super().__init__('General', *args, **kwargs)
 
 		self._string_pattern = re.compile(b'''([0-9]{2}/[0-9]{2}/[0-9]{2})\\(C\\) [0-9]+ General Software, Inc\\. ''')
-		self._version_pattern = re.compile(b'''General Software (?:\\x00 )?([^\\\\\\x0D\\x0A]+)(?:rel\\.|Revision)''')
+		self._version_pattern = re.compile(b'''General Software (?:\\x00 )?([^\\\\\\x0D\\x0A]+)(?:rel\\.|Revision|\\(tm\\) Version)''') # "(tm) Version" (TS-3100)
 
 	def can_handle(self, file_path, file_data, header_data):
 		# Extract version.
@@ -1712,6 +1800,27 @@ class GeneralSoftwareAnalyzer(Analyzer):
 
 		# Take this analyzer if we found a version and a string.
 		return self.version != '?' and self.string
+
+
+class GLaBIOSAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('GLaBIOS', *args, **kwargs)
+
+		self._version_pattern = re.compile(b'''([0-9]+\\.[0-9]+\\.[0-9]+)-([0-9A-Z]+) ''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		if b'GLaBIOS [' not in file_data:
+			return False
+
+		# Extract version and build as a string.
+		match = self._version_pattern.search(file_data)
+		if match:
+			self.version = match.group(1).decode('cp437', 'ignore')
+			self.string = match.group(2).decode('cp437', 'ignore')
+		else:
+			self.version = '?'
+
+		return True
 
 
 class IBMAnalyzer(Analyzer):
@@ -1938,6 +2047,27 @@ class JukoAnalyzer(Analyzer):
 		return True
 
 
+class KoehlmannAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('K\u00f6hlmann', *args, **kwargs)
+
+		# c't magazine V20-BIOS
+		self._version_pattern = re.compile(b'''(V20-BIOS) (?:\\xAF )?Version ([\\x21-\\x7E]+)[^\\x0A]*\\x0A\\(C\\) Peter K\\x94hlmann''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		match = self._version_pattern.search(file_data)
+		if not match:
+			return False
+
+		# Extract version.
+		self.version = match.group(2).decode('cp437', 'ignore')
+
+		# Extract name as a sign-on.
+		self.signon = match.group(1).decode('cp437', 'ignore')
+
+		return True
+
+
 class MRAnalyzer(Analyzer):
 	def __init__(self, *args, **kwargs):
 		super().__init__('MR', *args, **kwargs)
@@ -2042,6 +2172,7 @@ class OlivettiAnalyzer(Analyzer):
 		super().__init__('Olivetti', *args, **kwargs)
 
 		self._version_pattern = re.compile('''Version ([^\\s]+)''')
+		self._diag_version_pattern = re.compile(b'''\\x0D\\x0AResident Diagnostics\\x0D\\x0ARev ([\\x21-\\x7E]+)''') # (M19)
 
 		self.register_check_list([
 			((self._version_precheck, self._version),		AlwaysRunChecker),
@@ -2053,11 +2184,15 @@ class OlivettiAnalyzer(Analyzer):
 		self._trap_version = False
 
 	def can_handle(self, file_path, file_data, header_data):
-		if b'COPYRIGHT (C)   OLIVETTI' not in file_data or (b'No ROM BASIC available - RESET' not in file_data and b'ROM BASIC Not Available,' not in file_data):
+		if b'COPYRIGHT (C)   OLIVETTI' not in file_data:
+			return False
+		diag_match = self._diag_version_pattern.search(file_data)
+		if b'No ROM BASIC available - RESET' not in file_data and b'ROM BASIC Not Available,' not in file_data and not diag_match:
 			return False
 
-		# Start by assuming this is an unversioned BIOS.
-		self.version = '?'
+		# Start by assuming this is an unversioned BIOS, unless
+		# a resident diagnostics revision is present. (M19)
+		self.version = diag_match and diag_match.group(1).decode('cp437', 'ignore') or '?'
 
 		return True
 
@@ -2089,17 +2224,45 @@ class OlivettiAnalyzer(Analyzer):
 		return True
 
 
+class PattersonAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Patterson', *args, **kwargs)
+
+		# "Falcon Basic I / O System" (Hyundai SUPER-16T)
+		self._version_pattern = re.compile(b'''([\\x21-\\x7E]+(?: [\\x21-\\x7E]+)*?) +Basic +I */ *O +System +Version ([\\x21-\\x7E]+)\\x0D\\x0A''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		if b'PattersonLabs IBM' not in file_data:
+			return False
+
+		# Extract version.
+		match = self._version_pattern.search(file_data)
+		if match:
+			self.version = match.group(2).decode('cp437', 'ignore')
+
+			# Extract BIOS name as a sign-on.
+			self.signon = match.group(1).decode('cp437', 'ignore') + ' Basic I/O System'
+		else:
+			self.version = '?'
+
+		return True
+
+
 class PhilipsAnalyzer(Analyzer):
 	def __init__(self, *args, **kwargs):
 		super().__init__('Philips', *args, **kwargs)
 
-		self._version_pattern = re.compile(b'''\\x0DPhilips ROM BIOS Version ([\\x21-\\x7E]+) ''')
+		self._version_pattern = re.compile(b'''\\x0DPhilips ROM BIOS Version ([\\x21-\\x7E]+)[ \\x0D]''') # space or CR (P3345)
+		# Version at the beginning of the ROM (P3105, P3120)
+		self._p3105_version_pattern = re.compile(b'''([0-9]+\\.[0-9]+) *(?:\\x0D\\x0A)?\\x00\\xAA\\x8D\\xFE\\xDF\\x07\\xC0\\xF8\\x12\\x43\\xAF\\x72\\xBC\\x6E(?:Copyright)?\\(C\\) ?[0-9]{4} Philips ''')
 
 	def can_handle(self, file_path, file_data, header_data):
 		# Locate version.
 		match = self._version_pattern.search(file_data)
 		if not match:
-			return False
+			match = self._p3105_version_pattern.match(file_data)
+			if not match:
+				return False
 
 		# Extract version.
 		self.version = match.group(1).decode('cp437', 'ignore')
@@ -2122,8 +2285,8 @@ class PhoenixAnalyzer(Analyzer):
 
 		self._rombios_version_pattern = re.compile(
 			b'''(?:Phoenix )?''' # Phoenix brand (not always present)
-			b'''((?:80[0-9a-zA-Z]+|V[1-4]0 |[0-9]{3})(?:/EISA)? )?ROM BIOS (PLUS )?''' # branch (whatever lacked the "80" was lost to time)
-			b'''Ver(?:sion|s\\.)? ?([0-9]\\.[A-Z]?[0-9]{2})''' # actual version (can have short "Ver" with (JE1000) or without (BXM-8) space on small BIOSes, or "Vers." (NEC 80286 3.05T), or letter before version (Dell fork "1.P10"))
+			b'''((?:80[0-9a-zA-Z]+|V[1-4]0 |[0-9]{3})(?:/EISA)? )?ROM BIOS (PLUS[ \\x00])?''' # branch (whatever lacked the "80" was lost to time), NUL before version (Nixdorf 8810/30)
+			b'''Ver(?:sion|s\\.)? ?([A-Z]?[0-9]\\.[A-Z]?[0-9]{2})''' # actual version (can have short "Ver" with (JE1000) or without (BXM-8) space on small BIOSes, or "Vers." (NEC 80286 3.05T), or letter before version (Dell fork "1.P10"), or letter before everything (Informtech "N1.10.20"))
 			b'''[\\x20-\\x7E]*''' # added patch levels and OEM info
 		)
 		# Covers the Xx86 and for Pentium family.
@@ -3307,7 +3470,7 @@ class PhoenixAnalyzer(Analyzer):
 							# Add PLUS prefix if present.
 							pre_version = match.group(2)
 							if pre_version:
-								self.version = util.read_string(pre_version) + self.version
+								self.version = util.read_string(pre_version).strip() + ' ' + self.version
 
 							# Extract version prefix if present.
 							pre_version = match.group(1)
@@ -3320,7 +3483,7 @@ class PhoenixAnalyzer(Analyzer):
 								self.version = pre_version + ' ' + self.version # double space on V20
 
 							# Extract full version string as metadata.
-							version_string = util.read_string(match.group(0).replace(b'\xF0', b''))
+							version_string = util.read_string(match.group(0).replace(b'\xF0', b'').replace(b'\x00', b' '))
 							self.metadata.append(('ID', version_string))
 							self.debug_print('Raw ROM BIOS version:', repr(version_string))
 						else:
@@ -3639,6 +3802,26 @@ class QuadtelAnalyzer(Analyzer):
 		return True
 
 
+class SanyoAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Sanyo', *args, **kwargs)
+
+		self._version_pattern = re.compile(b'''ROM BIOS Version ([\\x21-\\x7E]+)''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		if b'(C)Copyright SANYO Electric Co.,Ltd.' not in file_data:
+			return False
+
+		# Extract version.
+		match = self._version_pattern.search(file_data)
+		if match:
+			self.version = match.group(1).decode('cp437', 'ignore')
+		else:
+			self.version = '?'
+
+		return True
+
+
 class SchneiderAnalyzer(Analyzer):
 	def __init__(self, *args, **kwargs):
 		super().__init__('Schneider', *args, **kwargs)
@@ -3657,6 +3840,27 @@ class SchneiderAnalyzer(Analyzer):
 
 		# Extract version.
 		self.version = match.group(1).decode('cp437', 'ignore')
+
+		return True
+
+
+class SVCAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('SVC', *args, **kwargs)
+
+		# The same image covers multiple CPU types, so take the version from the first one.
+		self._version_pattern = re.compile(b'''SVC [\\x20-\\x7E]+? AT BIOS Version ([\\x21-\\x7E]+)''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		if b'(c) Copyright (SVC) Silicon Valley Computer' not in file_data:
+			return False
+
+		# Extract version.
+		match = self._version_pattern.search(file_data)
+		if match:
+			self.version = match.group(1).decode('cp437', 'ignore')
+		else:
+			self.version = '?'
 
 		return True
 
@@ -3769,6 +3973,24 @@ class TandonAnalyzer(Analyzer):
 		return True
 
 
+class TandyAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Tandy', *args, **kwargs)
+
+		# Tandy 2000
+		self._version_pattern = re.compile(b'''BOOT ROM version ([\\x21-\\x7E]+)\\x0D\\x0ACopyright [0-9,]+ Tandy Corp\\.''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		match = self._version_pattern.search(file_data)
+		if not match:
+			return False
+
+		# Extract version.
+		self.version = match.group(1).decode('cp437', 'ignore')
+
+		return True
+
+
 class TinyBIOSAnalyzer(Analyzer):
 	def __init__(self, *args, **kwargs):
 		super().__init__('tinyBIOS', *args, **kwargs)
@@ -3832,6 +4054,46 @@ class ToshibaAnalyzer(Analyzer):
 		return True
 
 
+class TulipAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Tulip', *args, **kwargs)
+
+		self._version_pattern = re.compile(b'''VERSION ([0-9]+\\.[0-9]{2})''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		if b'TULIP AT bios' not in file_data:
+			return False
+
+		# Extract version.
+		match = self._version_pattern.search(file_data)
+		if match:
+			self.version = match.group(1).decode('cp437', 'ignore')
+		else:
+			self.version = '?'
+
+		return True
+
+
+class TurboXTAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Turbo XT', *args, **kwargs)
+
+		self._version_pattern = re.compile(b'''Turbo XT BIOS (v[0-9\\.]+) - ([0-9]{2}/[0-9]{2}/[0-9]{4})''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		match = self._version_pattern.search(file_data)
+		if not match:
+			return False
+
+		# Extract version.
+		self.version = match.group(1).decode('cp437', 'ignore')
+
+		# Extract date as a string.
+		self.string = match.group(2).decode('cp437', 'ignore')
+
+		return True
+
+
 class VademAnalyzer(Analyzer):
 	def __init__(self, *args, **kwargs):
 		super().__init__('Vadem', *args, **kwargs)
@@ -3887,6 +4149,23 @@ class WhizproAnalyzer(Analyzer):
 
 		# Extract sign-on.
 		self.signon = util.read_string(file_data[id_block_index:id_block_index + 0x20])
+
+		return True
+
+
+class Xi8088Analyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Xi 8088', *args, **kwargs)
+
+		self._version_pattern = re.compile(b'''Xi 8088 BIOS, Version ([\\x21-\\x7E]+?)\\. Copyright''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		match = self._version_pattern.search(file_data)
+		if not match:
+			return False
+
+		# Extract version.
+		self.version = match.group(1).decode('cp437', 'ignore')
 
 		return True
 

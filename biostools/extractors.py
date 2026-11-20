@@ -2905,8 +2905,15 @@ class InterleaveExtractor(Extractor):
 			b'Press any key when ready', # Access Methods
 			b'* AMPRO Little Board', # AMPRO
 			b'Philips ROM BIOS ', # Philips
+			b'Copyright SANYO Electric Co.', # Sanyo
+			b'COPR. NCR CORP.', # NCR (CDI)
+			b'TULIP COMPUTERS', # Tulip
 			b'The following POST errors have been ' # Acer
 		]
+
+		# Complementary name tokens used to pair parts when there are multiple
+		# candidates. (Micronics 386 with both EVEN/ODD and HI/LO sets)
+		self._complementary_tokens = (('even', 'odd'), ('high', 'low'), ('hi', 'lo'))
 
 		# Interleave the strings.
 		self._interleaved_odd = [string[1::2] for string in self._deinterleaved_strings]
@@ -2915,6 +2922,19 @@ class InterleaveExtractor(Extractor):
 		self._interleaved_q2 = [string[2::4] for string in self._deinterleaved_strings]
 		self._interleaved_q1 = [string[1::4] for string in self._deinterleaved_strings]
 		self._interleaved_q0 = [string[::4] for string in self._deinterleaved_strings]
+
+	def _complementary_candidate(self, file_name, candidates):
+		"""Return the candidate whose name matches this file's name with
+		   a complementary token (such as EVEN/ODD) swapped, if any."""
+		base_name = util.remove_extension(file_name).lower()
+		candidate_names = {util.remove_extension(candidate).lower(): candidate for candidate in candidates}
+		for token_a, token_b in self._complementary_tokens:
+			for token_from, token_to in ((token_a, token_b), (token_b, token_a)):
+				for match in re.finditer('''(?<![a-z])''' + token_from + '''(?![a-z])''', base_name):
+					swapped_name = base_name[:match.start()] + token_to + base_name[match.end():]
+					if swapped_name in candidate_names:
+						return candidate_names[swapped_name]
+		return None
 
 	def extract(self, file_path, file_header, dest_dir, dest_dir_0):
 		# Stop if this was already deinterleaved.
@@ -3000,9 +3020,13 @@ class InterleaveExtractor(Extractor):
 				# Add to the list of candidates.
 				counterpart_candidates.append(file_in_dir)
 
-			# Find the closest counterpart candidate to this
-			# file, and stop if no counterpart was found.
-			counterpart_candidate = util.closest_prefix(file_name, counterpart_candidates, lambda x: util.remove_extension(x).lower())
+			# Find the closest counterpart candidate to this file, preferring one
+			# with a complementary name, and stop if no counterpart was found.
+			counterpart_candidate = None
+			if len(counterpart_string_sets) == 1:
+				counterpart_candidate = self._complementary_candidate(file_name, counterpart_candidates)
+			if not counterpart_candidate:
+				counterpart_candidate = util.closest_prefix(file_name, counterpart_candidates, lambda x: util.remove_extension(x).lower())
 			if not counterpart_candidate:
 				return False
 			self.debug_print('Pairing', file_path, 'with', counterpart_candidate)
