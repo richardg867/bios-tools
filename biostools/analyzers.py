@@ -336,6 +336,8 @@ class AMIAnalyzer(Analyzer):
 			b'''(?:([\\x00-\\xFF]{2}/[0-9]{2}/[0-9]{2})\\(C\\)[0-9]{4} American Megatrends,? Inc(?:\\.,?.All.Rights.Reserved|/Hewlett-Packard Company)|[0-9]\\$RAIDUAC[0-9])'''
 		)
 		self._regtable_pattern = re.compile(b'''\\$\\$CT[\\x01\\x02]([\\x20-\\x7E]+)''')
+		# Early Dell-customized BIOS with no other AMI identification. (Dell System 310)
+		self._dell_early_pattern = re.compile(b'''Dell Computer Corp\\. +\\(C\\) [0-9]{4} AMI +PORTIONS COPR\\. [0-9]{4} DELL COMPUTER ALL RIGHTS RESERVED\\. [A-Z][a-z]{2} ([0-9]{2})-([0-9]{2})-[0-9]{2}([0-9]{2}) ''')
 		# Dash separator possible (TritonIDETimings on AMI Apollo and potentially others)
 		self._regtable_split_pattern = re.compile('''[- ]''')
 		# "Cfg" and "Config" (Acrosser AR-B1479 STPC Elite)
@@ -373,6 +375,18 @@ class AMIAnalyzer(Analyzer):
 	def can_handle(self, file_path, file_data, header_data):
 		check_match = self._check_pattern.search(file_data)
 		if not check_match:
+			# Handle early Dell-customized BIOS.
+			match = self._dell_early_pattern.search(file_data)
+			if match:
+				# Set static version.
+				self.version = 'Dell'
+
+				# Extract build date as a string.
+				self.string = '{0}/{1}/{2}'.format(*(group.decode('cp437', 'ignore') for group in match.groups()))
+				self.debug_print('Early Dell build date:', self.string)
+
+				return True
+
 			return False
 
 		# Extract Intel data in a preliminary manner in case extraction failed.
@@ -819,6 +833,7 @@ class AwardAnalyzer(Analyzer):
 		self._award_pattern = re.compile(b'''(?:Award|A w a r d) Software Inc\\.|AAwwaarrdd SSooffttwwaarree IInncc\\.\\.|COPYRIGHT AWARD SOFTWARE INC\\.|Award Decompression Bios''')
 		self._ast_pattern = re.compile(b'''\\(c\\) COPYRIGHT 1984,[0-9]{4}(?:A w a r d|Award) Software Inc\\.|IBM COMPATIBLE A(S)T BIOS''')
 		self._early_pattern = re.compile(b'''([0-9A-Z][\\x21-\\x7E]+) BIOS V([0-9.]+)[\\x21-\\x7E]* COPYRIGHT''')
+		self._wells_pattern = re.compile(b'''\\(c\\) COPYRIGHT [0-9,]+ WELLS AMERICAN CORP\\. ?ALL RIGHTS RESERVED (WAC [\\x21-\\x7E]+ [0-9]{2}/[0-9]{2}/[0-9]{2})''')
 		self._gigabyte_bif_pattern = re.compile(b'''\\$BIF[\\x00-\\xFF]{5}([\\x20-\\x7E]+)\\x00.([\\x20-\\x7E]+)\\x00''')
 		self._gigabyte_eval_pattern = re.compile('''\\([a-zA-Z0-9]{1,8}\\) EVALUATION ROM - NOT FOR SALE$''')
 		self._gigabyte_flag_pattern = re.compile(b'''GIGABYTEFLAG\\x00''')
@@ -1018,7 +1033,17 @@ class AwardAnalyzer(Analyzer):
 					# Extract sign-on.
 					self.signon = util.read_string(file_data[id_block_index + 0x3c:id_block_index + 0x8c])
 				else:
-					return False
+					# Handle Wells American modified Award. (A*Star)
+					match = self._wells_pattern.search(file_data)
+					if not match:
+						return False
+					self.debug_print('Wells American ID found at', hex(match.start(0)))
+
+					# Set static version.
+					self.version = 'Wells American'
+
+					# Extract Wells American identifier and date as a string.
+					self.string = match.group(1).decode('cp437', 'ignore')
 
 		# Split sign-on lines.
 		# Vertical tab characters may be employed. (??? reported by BurnedPinguin)
@@ -2043,6 +2068,32 @@ class JukoAnalyzer(Analyzer):
 
 		# Extract string.
 		self.string = match.group(1).decode('cp437', 'ignore')
+
+		return True
+
+
+class KiselevAnalyzer(Analyzer):
+	def __init__(self, *args, **kwargs):
+		super().__init__('Kiselev', *args, **kwargs)
+
+		# Sergey Kiselev's 8088_bios, built for multiple machines: "Sergey's XT" (0.7),
+		# "Xi 8088" (0.8+), "Micro 8088", "XT 8088" (0.9.4+), "Book8088", "Homebrew8088" (1.0+)
+		# Machine names are listed explicitly, as his option ROMs share the same format. (Multi-Floppy BIOS)
+		self._version_pattern = re.compile(b'''\\x0D\\x0A(Sergey's XT|Xi 8088|Micro 8088|XT 8088|Book8088|Homebrew8088) BIOS, Version ([\\x21-\\x7E]+?)\\. Copyright \\(C\\) [0-9 ,\\-]+ Sergey Kiselev''')
+
+	def can_handle(self, file_path, file_data, header_data):
+		match = self._version_pattern.search(file_data)
+		if not match:
+			return False
+
+		# Extract version.
+		self.version = match.group(2).decode('cp437', 'ignore')
+
+		# Extract machine name as a sign-on.
+		self.signon = match.group(1).decode('cp437', 'ignore') + ' BIOS'
+
+		# Extract build date as a string.
+		NoInfoAnalyzer.get_entrypoint_dates(self, file_data)
 
 		return True
 
@@ -4149,23 +4200,6 @@ class WhizproAnalyzer(Analyzer):
 
 		# Extract sign-on.
 		self.signon = util.read_string(file_data[id_block_index:id_block_index + 0x20])
-
-		return True
-
-
-class Xi8088Analyzer(Analyzer):
-	def __init__(self, *args, **kwargs):
-		super().__init__('Xi 8088', *args, **kwargs)
-
-		self._version_pattern = re.compile(b'''Xi 8088 BIOS, Version ([\\x21-\\x7E]+?)\\. Copyright''')
-
-	def can_handle(self, file_path, file_data, header_data):
-		match = self._version_pattern.search(file_data)
-		if not match:
-			return False
-
-		# Extract version.
-		self.version = match.group(1).decode('cp437', 'ignore')
 
 		return True
 

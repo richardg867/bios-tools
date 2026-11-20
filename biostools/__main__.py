@@ -595,6 +595,7 @@ def analyze_process(queue, formatter, scan_base, options):
 		analyzers.InsydeAnalyzer(),
 		analyzers.IntelUEFIAnalyzer(),
 		analyzers.JukoAnalyzer(),
+		analyzers.KiselevAnalyzer(),
 		analyzers.KoehlmannAnalyzer(),
 		analyzers.MylexAnalyzer(),
 		analyzers.OlivettiAnalyzer(),
@@ -612,7 +613,6 @@ def analyze_process(queue, formatter, scan_base, options):
 		analyzers.TurboXTAnalyzer(),
 		analyzers.VademAnalyzer(),
 		analyzers.WhizproAnalyzer(),
-		analyzers.Xi8088Analyzer(),
 		analyzers.ZenithAnalyzer(),
 	]
 
