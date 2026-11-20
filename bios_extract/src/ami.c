@@ -646,7 +646,13 @@ AFUDOSExtract(unsigned char *BIOSImage, int BIOSLength, int BIOSOffset,
 
 	char *argv[] = {"", "afudos.bin"};
 	int ret = main(2, argv);
-	unlink("afudos.bin");
+	if (ret) {
+		/* Keep the decompressed image if bios_extract cannot handle it
+		   (such as an Aptio UEFI image), so other tools can process it. */
+		rename("afudos.bin", "afudos.rom");
+	} else {
+		unlink("afudos.bin");
+	}
 
-	return !ret;
+	return TRUE;
 }
